@@ -1,0 +1,172 @@
+name: Gemini Code Review Enforcement
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-gemini-review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Set Initial Status to Pending
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'Gemini Code Review',
+              description: 'Checking for Gemini Code Assist review...'
+            });
+
+      - name: Check for Gemini Review
+        id: check_review
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const geminiComment = comments.data.find(comment => 
+              comment.user.login.includes('gemini') || 
+              comment.body.includes('Gemini Code Assist') ||
+              comment.user.type === 'Bot'
+            );
+            
+            if (!geminiComment) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'pending',
+                context: 'Gemini Code Review',
+                description: 'Waiting for Gemini Code Assist review'
+              });
+              core.setFailed('Gemini Code Assist review not found. Waiting for review...');
+              return;
+            }
+            
+            console.log('Gemini review found');
+            core.setOutput('review_found', 'true');
+            core.setOutput('comment_id', geminiComment.id);
+
+      - name: Check if Suggestions Addressed
+        id: check_addressed
+        if: steps.check_review.outputs.review_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            // Check if any comment indicates suggestions were addressed
+            const addressedPattern = /(gemini.*(applied|accepted|implemented|addressed|reviewed|rejected|handled))|((applied|accepted|implemented|addressed|reviewed|rejected|handled).*gemini)/i;
+            
+            const hasAddressed = comments.data.some(comment => 
+              addressedPattern.test(comment.body)
+            );
+            
+            if (hasAddressed) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'success',
+                context: 'Gemini Code Review',
+                description: 'Gemini suggestions addressed ✓'
+              });
+            } else {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'pending',
+                context: 'Gemini Code Review',
+                description: 'Please address Gemini suggestions'
+              });
+              core.setFailed('Gemini suggestions not yet addressed');
+            }
+
+  verify-suggestions-addressed:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+    steps:
+      - name: Check if comment is about Gemini suggestions
+        id: check_comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const comment = context.payload.comment.body.toLowerCase();
+            
+            // Check if comment indicates suggestions were addressed
+            const acceptedPattern = /(applied|accepted|implemented|fixed|resolved|done)/i;
+            const rejectedPattern = /(rejected|declined|not applicable|won't fix|wontfix)/i;
+            const reviewedPattern = /(reviewed|addressed|handled)/i;
+            
+            const hasAccepted = acceptedPattern.test(comment);
+            const hasRejected = rejectedPattern.test(comment);
+            const hasReviewed = reviewedPattern.test(comment);
+            
+            core.setOutput('suggestions_addressed', hasAccepted || hasRejected || hasReviewed);
+            
+            return {
+              addressed: hasAccepted || hasRejected || hasReviewed,
+              comment: comment
+            };
+
+      - name: Update PR Status
+        if: steps.check_comment.outputs.suggestions_addressed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: pr.data.head.sha,
+              state: 'success',
+              context: 'Gemini Code Review',
+              description: 'Gemini suggestions have been addressed'
+            });
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ Gemini Code Assist suggestions have been addressed. PR is ready for merge.'
+            });
+
+      - name: Require Manual Review Label
+        if: steps.check_comment.outputs.suggestions_addressed != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            // Add label to track review status
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['gemini-review-pending']
+            });

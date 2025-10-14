@@ -44,7 +44,7 @@ const Header = props => {
             <span className="nav_text">Home</span>
           </Link>
           <Link class="link" to="/jobs">
-            <span class="nav_text">Jobs</span>
+            <span class="nav_text">Jobs (All countried)</span>
           </Link>
         </li>
         <li className="btn_container">

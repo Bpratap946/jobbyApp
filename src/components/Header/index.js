@@ -41,7 +41,7 @@ const Header = props => {
         </li>
         <li className="home_jobs_container">
           <Link className="link" to="/">
-            <h1 className="nav_text">Home</h1>
+            <span className="nav_text">Dashboard</span>
           </Link>
           <Link className="link" to="/jobs">
             <h1 className="nav_text">Jobs</h1>

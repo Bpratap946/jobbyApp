@@ -41,10 +41,10 @@ const Header = props => {
         </li>
         <li className="home_jobs_container">
           <Link className="link" to="/">
-            <span className="nav_text">Home</span>
+            <span class="nav_text">Home</span>
           </Link>
-          <Link className="link" to="/jobs">
-            <h1 className="nav_text">Jobs</h1>
+          <Link class="link" to="/jobs">
+            <span class="nav_text">Jobs</span>
           </Link>
         </li>
         <li className="btn_container">

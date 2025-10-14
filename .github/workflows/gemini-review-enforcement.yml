@@ -1,33 +1,45 @@
-name: Gemini Code Review Enforcement
+name: Gemini Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
     types: [created, edited, deleted]
-  pull_request_review_thread:
-    types: [resolved, unresolved]
   issue_comment:
     types: [created, edited, deleted]
+  # Allow manual re-check by commenting /check-gemini
+  workflow_dispatch:
 
 jobs:
   check-gemini-review:
     runs-on: ubuntu-latest
     steps:
-      - name: Get PR Details
-        id: pr_details
+      - name: Get PR Number
+        id: get_pr
         uses: actions/github-script@v7
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
-            const prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
+            let prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
             
             if (!prNumber) {
-              console.log('Not a PR event, skipping');
+              console.log('Not a PR event');
+              core.setOutput('skip', 'true');
               return;
             }
+            
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('skip', 'false');
+
+      - name: Check Gemini Review Status
+        if: steps.get_pr.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const prNumber = ${{ steps.get_pr.outputs.pr_number }};
             
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -35,8 +47,7 @@ jobs:
               pull_number: prNumber
             });
             
-            core.setOutput('pr_number', prNumber);
-            core.setOutput('head_sha', pr.head.sha);
+            const headSha = pr.head.sha;
             
             // Check if PR modifies workflow files
             const { data: files } = await github.rest.pulls.listFiles({
@@ -49,31 +60,18 @@ jobs:
               file.filename.startsWith('.github/workflows/')
             );
             
-            core.setOutput('skip_check', hasWorkflowChanges ? 'true' : 'false');
-
-      - name: Skip Check for Workflow Changes
-        if: steps.pr_details.outputs.skip_check == 'true'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ steps.pr_details.outputs.head_sha }}',
-              state: 'success',
-              context: 'Gemini Code Review',
-              description: 'Skipped for workflow changes'
-            });
-
-      - name: Check Gemini Review Status
-        if: steps.pr_details.outputs.skip_check != 'true' && steps.pr_details.outputs.pr_number != ''
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const prNumber = ${{ steps.pr_details.outputs.pr_number }};
-            const headSha = '${{ steps.pr_details.outputs.head_sha }}';
+            if (hasWorkflowChanges) {
+              console.log('PR modifies workflow files - auto-approving');
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: headSha,
+                state: 'success',
+                context: 'Gemini Code Review',
+                description: 'Skipped for workflow changes'
+              });
+              return;
+            }
             
             // Use GraphQL to get review threads with resolution status
             const query = `
@@ -83,14 +81,12 @@ jobs:
                     reviewThreads(first: 100) {
                       nodes {
                         isResolved
-                        isCollapsed
                         comments(first: 10) {
                           nodes {
                             author {
                               login
                             }
                             body
-                            createdAt
                           }
                         }
                       }
@@ -101,7 +97,6 @@ jobs:
                           login
                         }
                         body
-                        createdAt
                       }
                     }
                   }
@@ -109,28 +104,11 @@ jobs:
               }
             `;
             
-            const variables = {
+            const result = await github.graphql(query, variables = {
               owner: context.repo.owner,
               repo: context.repo.repo,
               prNumber: prNumber
-            };
-            
-            let result;
-            try {
-              result = await github.graphql(query, variables);
-            } catch (error) {
-              console.log('GraphQL query failed:', error);
-              // Fallback to pending status if query fails
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: headSha,
-                state: 'pending',
-                context: 'Gemini Code Review',
-                description: 'Checking for Gemini review...'
-              });
-              return;
-            }
+            });
             
             const reviewThreads = result.repository.pullRequest.reviewThreads.nodes;
             const comments = result.repository.pullRequest.comments.nodes;
@@ -146,14 +124,13 @@ jobs:
             
             console.log(`Found ${geminiComments.length} Gemini comments`);
             
-            // Check if Gemini has posted "Code Review" (not just "Summary of Changes")
-            const hasSummary = geminiComments.some(comment => 
-              comment.body.includes('Summary of Changes')
+            // Check if Gemini has posted reviews
+            const hasSummary = geminiComments.some(c => 
+              c.body.includes('Summary of Changes')
             );
             
-            const hasCodeReview = geminiComments.some(comment => 
-              comment.body.includes('Code Review') &&
-              !comment.body.includes('Summary of Changes')
+            const hasCodeReview = geminiComments.some(c => 
+              c.body.includes('Code Review') && !c.body.includes('Summary of Changes')
             );
             
             // Filter Gemini review threads (inline code comments)
@@ -164,77 +141,82 @@ jobs:
                       firstComment.author.login.includes('code-assist'));
             });
             
-            console.log(`Found ${geminiThreads.length} Gemini review threads`);
+            console.log(`Gemini threads: ${geminiThreads.length}`);
             console.log(`Has Summary: ${hasSummary}, Has Code Review: ${hasCodeReview}`);
             
-            // Case 1: No Gemini interaction at all
-            if (geminiComments.length === 0 && geminiThreads.length === 0) {
-              console.log('No Gemini activity detected yet');
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: headSha,
-                state: 'pending',
-                context: 'Gemini Code Review',
-                description: 'Waiting for Gemini to review...'
-              });
-              return;
+            // Status logic
+            let state, description;
+            
+            // Case 1: No Gemini activity at all
+            if (!hasSummary && !hasCodeReview && geminiThreads.length === 0) {
+              state = 'pending';
+              description = 'Waiting for Gemini to review...';
+              console.log('No Gemini activity detected');
+            }
+            // Case 2: Only summary, no code review yet
+            else if (hasSummary && !hasCodeReview && geminiThreads.length === 0) {
+              state = 'pending';
+              description = 'Gemini is reviewing... please wait';
+              console.log('Only summary posted, waiting for code review');
+            }
+            // Case 3: Code review posted with NO inline suggestions
+            else if (hasCodeReview && geminiThreads.length === 0) {
+              state = 'success';
+              description = 'Gemini reviewed - no suggestions ✓';
+              console.log('Code review posted with no suggestions');
+            }
+            // Case 4: Has inline suggestions
+            else if (geminiThreads.length > 0) {
+              const unresolvedThreads = geminiThreads.filter(t => !t.isResolved);
+              const resolvedThreads = geminiThreads.filter(t => t.isResolved);
+              
+              console.log(`Resolved: ${resolvedThreads.length}, Unresolved: ${unresolvedThreads.length}`);
+              
+              if (unresolvedThreads.length > 0) {
+                state = 'failure';
+                description = `${unresolvedThreads.length} suggestion(s) need resolution`;
+              } else {
+                state = 'success';
+                description = 'All suggestions resolved ✓';
+              }
+            }
+            // Fallback
+            else {
+              state = 'pending';
+              description = 'Checking Gemini review status...';
             }
             
-            // Case 2: Only summary posted, waiting for actual review
-            if (hasSummary && !hasCodeReview && geminiThreads.length === 0) {
-              console.log('Gemini posted summary, waiting for Code Review...');
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: headSha,
-                state: 'pending',
-                context: 'Gemini Code Review',
-                description: 'Gemini is reviewing... please wait'
-              });
-              return;
-            }
+            console.log(`Final status: ${state} - ${description}`);
             
-            // Case 3: Code Review posted but no inline suggestions
-            if (hasCodeReview && geminiThreads.length === 0) {
-              console.log('Gemini reviewed with no inline suggestions - approved!');
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: headSha,
-                state: 'success',
-                context: 'Gemini Code Review',
-                description: 'Gemini review complete - no suggestions ✓'
-              });
-              return;
-            }
-            
-            // Case 4: Has inline suggestions - check if all are resolved
-            const unresolvedThreads = geminiThreads.filter(thread => !thread.isResolved);
-            
-            console.log(`Total Gemini threads: ${geminiThreads.length}`);
-            console.log(`Unresolved threads: ${unresolvedThreads.length}`);
-            
-            if (unresolvedThreads.length > 0) {
-              console.log('Gemini has unresolved suggestions');
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: headSha,
-                state: 'failure',
-                context: 'Gemini Code Review',
-                description: `${unresolvedThreads.length} Gemini suggestion(s) need resolution`
-              });
-              return;
-            }
-            
-            // Case 5: All suggestions resolved!
-            console.log('✓ All Gemini suggestions have been resolved!');
+            // Set the commit status
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: headSha,
-              state: 'success',
+              state: state,
               context: 'Gemini Code Review',
-              description: 'All Gemini suggestions resolved ✓'
+              description: description
             });
+            
+            // If there are unresolved threads, also comment on the PR
+            if (state === 'failure') {
+              const existingComments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+              
+              const botComment = existingComments.data.find(c => 
+                c.user.type === 'Bot' && 
+                c.body.includes('Gemini suggestions need resolution')
+              );
+              
+              if (!botComment) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `⚠️ **Gemini suggestions need resolution**\n\nPlease review and resolve all Gemini Code Assist suggestions before merging.\n\n- Apply suggestions you agree with by clicking "Commit suggestion"\n- Mark conversations as resolved for suggestions you don't want to apply\n\nOnce all conversations are resolved, add a comment (any comment) to re-trigger this check.`
+                });
+              }
+            }
